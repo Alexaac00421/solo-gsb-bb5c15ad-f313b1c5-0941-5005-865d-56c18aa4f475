@@ -6,6 +6,8 @@
 （按"偏离服务数 → 偏移总时长 → 尽早发布"三层词典序优化），二者均不豁免任何既有约束。
 发布评审时可要求返回 **1~5 个备选方案**：首项沿用同一优化目标，后续每项满足全部约束，
 且与此前每项方案至少有一个未锁定服务的部署开始时刻相差达到最小差距。
+发布评审还可查询**单项服务延迟容忍度**：在基线排程上对每个未锁定服务逐分钟推迟，
+给出从 0 分钟起连续仍满足全部约束的最大延迟、上限内首个失效分钟及触发的约束组合。
 
 ## 约束语义
 
@@ -501,6 +503,99 @@ curl -X POST http://localhost:8000/api/schedule \
 }
 ```
 
+### `POST /api/schedule/tolerance` — 单项服务延迟容忍度（本轮新增）
+
+发布评审需要知道**现有排程能容忍某个服务推迟多久**时，提交一份现有排程请求和一个
+正整数延迟上限（分钟）。系统先**按现有规则求基线排程**（与 `/api/schedule` 首项完全一致，
+含锁定 / 参考时刻的分层目标），再对每个**未锁定服务**：保持其他服务的基线开始时刻不变，
+把该服务的部署开始时刻**逐分钟推迟**（0、1、2 … 直到上限），每一分钟都用与排程完全相同的
+规则检查候选时间窗、依赖先后、团队禁发、维护冻结与共享资源分时容量
+（延迟后的部署及回滚占用均按原规则判断）。
+
+请求体：
+
+```json
+{
+  "max_delay_minutes": 120,
+  "request": { ...一份完整的 /api/schedule 请求体... }
+}
+```
+
+- `max_delay_minutes`：延迟上限，**正整数分钟**（非正整数按 422 拒绝）。
+- `request`：现有排程请求，字段与校验规则同 `/api/schedule`；`alternative_count`
+  不影响基线首项，可省略。
+
+响应中每个服务一项 `tolerances`（按基线开始时刻排序）：
+
+| 字段 | 含义 |
+|---|---|
+| `locked` | 已确认（`pinned_starts`）服务为 `true`：**不可推迟**，不计算容忍度 |
+| `baseline_start_utc` | 该服务在基线排程中的部署开始时刻 |
+| `max_delay_minutes` | 从 0 分钟起**连续**仍满足全部约束的最大延迟（不超过上限） |
+| `first_failure_minute` | 上限内**首个失效分钟**；上限内逐分钟均可行时为 `null` |
+| `first_failure_start_utc` | 首个失效分钟对应的部署开始时刻（无失效分钟为 `null`） |
+| `triggered` | 首个失效分钟**触发的约束组合**（与无解时 `blockers` 同源的阻塞核；无失效分钟为 `null`） |
+
+规则细节：
+
+- **连续可行、不跳过失效分钟**：一旦某分钟失效即停止该服务的扫描——即使更晚的时段
+  （例如越过一段冻结之后）重新可行，也不越过该失效分钟；`max_delay_minutes` 只统计
+  从 0 分钟起的连续可行段。
+- **锁定服务**（`pinned_starts`）必须准时部署，标为 `locked: true`，
+  `max_delay_minutes` / `first_failure_minute` / `triggered` 均为 `null`。
+- **基线无解或未定**（`infeasible` / `unknown`）时返回原有的阻塞组合或未定状态，
+  `tolerances` 为 `null`，不输出容忍度；**输入非法**沿用现有 422 校验错误格式。
+- 占用终点越出该服务最后候选窗终点时，直接触发候选窗约束（`window:<服务ID>`）；
+  其余失效分钟触发的约束由求解器阻塞核给出（如 `resource:db`、`dependency:a->b`、
+  `freeze:…`、`blackout:…`、`resource:<资源>:<时段起点>` 等）。
+- 容忍度扫描使用一份独立的 `max_solve_seconds` 预算；扫描超时返回
+  `status: "unknown"`、`tolerances: null`，可增大时限或减小上限后重试。
+
+调用示例（curl）：两个服务共享容量 1 的 `db`，`a` 排在 `00:00`、`b` 排在 `01:00`：
+
+```bash
+curl -X POST http://localhost:8000/api/schedule/tolerance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "max_delay_minutes": 120,
+    "request": {
+      "services": [
+        {"id":"a","name":"服务 A","timezone":"UTC",
+         "duration_minutes":60,"rollback_minutes":0,"resources":["db"],
+         "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T08:00:00Z","timezone":"UTC"}]},
+        {"id":"b","name":"服务 B","timezone":"UTC",
+         "duration_minutes":60,"rollback_minutes":0,"resources":["db"],
+         "windows":[{"start":"2026-12-01T00:00:00Z","end":"2026-12-01T08:00:00Z","timezone":"UTC"}]}
+      ]
+    }
+  }'
+```
+
+返回（200，节选）：`a` 后面紧贴着 `b`，推迟 1 分钟即与 `b` 的占用冲突；
+`b` 之后无其他占用，上限 120 分钟内均可推迟：
+
+```json
+{
+  "feasible": true,
+  "status": "optimal",
+  "baseline": ["…a 00:00 → b 01:00…"],
+  "max_delay_minutes": 120,
+  "tolerances": [
+    {"service_id": "a", "locked": false, "baseline_start_utc": "2026-12-01T00:00:00+00:00",
+     "max_delay_minutes": 0, "first_failure_minute": 1,
+     "first_failure_start_utc": "2026-12-01T00:01:00+00:00",
+     "triggered": [{"code": "resource:db", "message": "共享资源 db 同时只能被一个服务占用…"}]},
+    {"service_id": "b", "locked": false, "baseline_start_utc": "2026-12-01T01:00:00+00:00",
+     "max_delay_minutes": 120, "first_failure_minute": null,
+     "first_failure_start_utc": null, "triggered": null}
+  ]
+}
+```
+
+若把 `a` 加入 `pinned_starts`，则 `a` 的容忍度项变为 `locked: true`（不可推迟）。
+基线无解时（例如冻结覆盖全部候选窗）返回 `feasible: false`、原有 `blockers`，
+`tolerances` 为 `null`。
+
 ### `POST /api/schedule/diff` — 变更影响预演
 
 变更评审时，提交一份**当前排程请求**和一份**修改后的请求**，系统分别独立求解，
@@ -636,11 +731,12 @@ curl -X POST http://localhost:8000/api/schedule/diff \
 
 ```
 app/
-  main.py        FastAPI 入口（/api/schedule、/api/schedule/diff、/api/health、静态页面）
+  main.py        FastAPI 入口（/api/schedule、/api/schedule/tolerance、/api/schedule/diff、/api/health、静态页面）
   models.py      请求/响应 Pydantic 模型
   times.py       时区解析与 DST 重复/不存在分类（zoneinfo fold 规则）
   validator.py   输入校验：DST、引用完整性、依赖环检测、区间合法性
   scheduler.py   CP-SAT 建模、求解、不可行假设核（blocking core）提取
+  tolerance.py   单项服务延迟容忍度：基线求解与逐分钟推迟扫描
   diff.py        变更影响预演：双请求执行与按服务 ID 的时刻对齐求差
   web/index.html 操作页面（原生 JS，内置 3 个示例场景）
 Dockerfile

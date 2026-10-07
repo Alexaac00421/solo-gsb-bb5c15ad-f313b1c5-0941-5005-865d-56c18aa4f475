@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,9 +19,14 @@ from .models import (
     ScheduleItem,
     ScheduleRequest,
     ScheduleResponse,
+    ServiceTolerance,
+    ToleranceRequest,
+    ToleranceResponse,
 )
 from .diff import build_diff, run_request
 from .times import to_local_display
+from .tolerance import scan_tolerances, solve_baseline
+from .validator import validate_and_normalize
 
 app = FastAPI(
     title="跨时区发布窗口编排",
@@ -108,6 +114,67 @@ def _build_item(norm, sid: str, st: int) -> ScheduleItem:
         timezone=s.timezone,
         window_used=window_text,
         resources=s.resources,
+    )
+
+
+@app.post("/api/schedule/tolerance", response_model=ToleranceResponse)
+def schedule_tolerance(body: ToleranceRequest):
+    """发布评审：单项服务延迟容忍度。
+
+    先按现有规则求基线排程；再对每个未锁定服务，保持其他服务的基线开始时刻不变，
+    逐分钟推迟其部署开始时刻（0..max_delay_minutes），给出从 0 分钟起连续仍满足
+    全部约束的最大延迟、上限内首个失效分钟及触发的约束组合。锁定服务标为不可推迟。
+    基线无解/未定时返回原有阻塞组合/未定状态，不输出容忍度。
+    """
+    req = body.request
+
+    if not req.services:
+        return ToleranceResponse(
+            feasible=False, status="infeasible",
+            blockers=[BlockingConstraint(code="empty_services",
+                                        message="至少需要一个服务")],
+        )
+
+    norm, errors = validate_and_normalize(req)
+    if errors:
+        # 422：输入本身有问题，沿用现有校验错误格式。
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=422,
+                            content={"errors": errors})
+
+    # 基线：与 /api/schedule 首项完全一致；无解/未定时沿用原有阻塞/未定响应，
+    # 不输出容忍度。
+    baseline = solve_baseline(norm)
+    if not baseline.feasible:
+        return ToleranceResponse(
+            feasible=False,
+            status=baseline.status,
+            blockers=[BlockingConstraint(**b) for b in (baseline.blockers or [])],
+        )
+
+    assert baseline.starts is not None
+    starts = baseline.starts
+
+    # 逐服务逐分钟扫描；扫描自身使用一份独立的 max_solve_seconds 预算。
+    deadline = time.monotonic() + norm.max_solve_seconds
+    tolerances = scan_tolerances(norm, starts, body.max_delay_minutes, deadline)
+    if tolerances is None:
+        return ToleranceResponse(
+            feasible=False, status="unknown",
+            blockers=[BlockingConstraint(
+                code="solver_unknown",
+                message="延迟容忍度扫描在 max_solve_seconds 时限内未能完成，"
+                        "按约定不输出容忍度；可增大 max_solve_seconds 或减小 "
+                        "max_delay_minutes 后重试")],
+        )
+
+    return ToleranceResponse(
+        feasible=True,
+        status=baseline.status,
+        baseline=[_build_item(norm, sid, st)
+                  for sid, st in sorted(starts.items(), key=lambda kv: kv[1])],
+        max_delay_minutes=body.max_delay_minutes,
+        tolerances=[ServiceTolerance(**t) for t in tolerances],
     )
 
 

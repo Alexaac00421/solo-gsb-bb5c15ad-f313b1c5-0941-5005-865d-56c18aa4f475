@@ -152,6 +152,46 @@ class ScheduleResponse(BaseModel):
         None, description="备选方案结果；仅在请求给出 alternative_count 时非空")
 
 
+# ---- 发布评审：单项服务延迟容忍度（/api/schedule/tolerance） ----
+
+
+class ToleranceRequest(BaseModel):
+    request: ScheduleRequest = Field(..., description="现有排程请求（与 /api/schedule 请求体相同），"
+                                                      "先按现有规则求基线排程")
+    max_delay_minutes: int = Field(
+        ..., gt=0,
+        description="延迟上限（正整数分钟）：对每个未锁定服务，从 0 分钟起逐分钟推迟其部署开始时刻，"
+                    "检查到该上限为止")
+
+
+class ServiceTolerance(BaseModel):
+    service_id: str
+    name: str
+    locked: bool = Field(..., description="True 表示已确认（锁定）服务：不可推迟，不计算容忍度")
+    baseline_start_utc: str | None = Field(None, description="基线排程中的部署开始时刻（UTC）")
+    max_delay_minutes: int | None = Field(
+        None, description="从 0 分钟起连续仍满足候选窗、依赖、团队禁发、维护冻结及共享资源分时容量的"
+                          "最大延迟分钟数（不超过上限）；锁定服务为 null")
+    first_failure_minute: int | None = Field(
+        None, description="上限内首个失效的延迟分钟数；上限内逐分钟均可行为 null；锁定服务为 null")
+    first_failure_start_utc: str | None = Field(
+        None, description="首个失效分钟对应的部署开始时刻（UTC）；无失效分钟为 null")
+    triggered: list[BlockingConstraint] | None = Field(
+        None, description="首个失效分钟触发的约束组合（阻塞核）；无失效分钟为 null")
+
+
+class ToleranceResponse(BaseModel):
+    feasible: bool
+    status: str  # "optimal" | "feasible" | "infeasible" | "unknown"
+    baseline: list[ScheduleItem] | None = Field(
+        None, description="按现有规则求得的基线排程（与 /api/schedule 首项一致）")
+    blockers: list[BlockingConstraint] | None = Field(
+        None, description="基线无解/未定时返回原有的阻塞组合或未定说明，此时不输出容忍度")
+    max_delay_minutes: int | None = Field(None, description="本次扫描使用的延迟上限（分钟）")
+    tolerances: list[ServiceTolerance] | None = Field(
+        None, description="各服务的延迟容忍度（按基线开始时刻排序）；基线无解/未定时为 null")
+
+
 # ---- 变更影响预演（/api/schedule/diff） ----
 
 
